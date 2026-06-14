@@ -303,20 +303,21 @@ print(f"  {'Iter':<6} {'MSE train (norm.)':>20} {'||grad||':>16}  Estado")
 print("  " + "-" * 58)
 
 for it in range(1, MAX_W + 1):
-    resid = Ytr - Xtr @ W
-    mse   = np.mean(resid ** 2)
-    g     = -(2 / len(Ytr)) * (Xtr.T @ resid)
-
-    loss_hist_mv.append(mse)
-    grad_hist_mv.append(np.linalg.norm(g))
-
-    # Actualizacion coordinada
+    # Actualizacion coordinada (Gauss-Seidel: usa W actualizado en cada paso)
     for j in range(p):
         xj      = Xtr[:, j]
         resid_j = Ytr - Xtr @ W
         dL_j    = -(2 / len(Ytr)) * np.dot(xj, resid_j)
         d2L_j   =  (2 / len(Ytr)) * np.dot(xj, xj)
         W[j]   -= dL_j / d2L_j
+
+    # Gradiente y MSE evaluados DESPUES de los updates de esta iteracion
+    resid = Ytr - Xtr @ W
+    mse   = np.mean(resid ** 2)
+    g     = -(2 / len(Ytr)) * (Xtr.T @ resid)
+
+    loss_hist_mv.append(mse)
+    grad_hist_mv.append(np.linalg.norm(g))
 
     n_conv_mv = it
     estado = ""
@@ -382,257 +383,659 @@ for r in rows:
 print("\n  * L-BFGS estimado teorico (Nocedal & Wright, 2006)\n")
 
 # =============================================================================
-#  SECCION C -- RED NEURONAL fitnet(10) -- PyTorch
+#  SECCION C -- RED NEURONAL fitnet2({N_H1_LM},{N_H2_LM}) CON LEVENBERG-MARQUARDT
+#
+#  El algoritmo Levenberg-Marquardt (LM) usa la JACOBIANA EXPLICITA:
+#    J[i,k] = d(r_i)/d(W_k)  donde r_i = y_pred_i - y_real_i
+#
+#  Actualizacion: (J^T J + mu*I) DW = -J^T r
+#  La Jacobiana se calcula analiticamente para la red tanh de 1 capa oculta.
+#
+#  RESTRICCION de parametros: J crece como N*P.
+#  Con P=321 y N_J=2000: J es 2000x321 ~ 5 MB (float64), sistema 321x321.
 # =============================================================================
-
-import numpy as np
-import matplotlib.pyplot as plt
 
 # -- Importacion de PyTorch ---------------------------------------------------
 try:
     import torch
     import torch.nn as nn
-    from torch.utils.data import TensorDataset, DataLoader
 except ImportError:
     raise ImportError(
         "\n  PyTorch no esta instalado.\n"
         "  Ejecuta: pip install torch\n"
-        "  O con CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu118"
     )
 
+N_H1_LM = 32   # neuronas capa oculta 1
+N_H2_LM = 22   # neuronas capa oculta 2
+N_H3_LM = 14   # neuronas capa oculta 3
+
 print("\n" + "=" * 65)
-print("  SECCION C: Red Neuronal fitnet(10) -- PyTorch")
-print("  Arquitectura: 10 -> [10, tanh] -> 1 (lineal)")
+print(f"  SECCION C: fitnet2({N_H1_LM},{N_H2_LM}) con Levenberg-Marquardt")
+print("  Jacobiana analitica: J[i,k] = d(r_i)/d(W_k), forma (N_J, P)")
 print("=" * 65)
 
 # =============================================================================
-#  C.1 -- PREPARACION DE DATOS PYTORCH
+#  C.1 -- FEATURES AMPLIADOS (27) CON FEATURE ENGINEERING
 #
-#  Se reutilizan los arrays normalizados de Seccion B:
-#    Xtr[:, 1:]  -> quitamos la columna de bias (PyTorch la maneja internamente)
-#    Ytr, Yte   -> targets normalizados
+#  Feature clave: precio mediano por zipcode (calculado solo en training
+#  para evitar data leakage). Captura efectos de mercado local mejor que
+#  las coordenadas continuas lat/long para una red tanh.
+#  Transformaciones log sobre sqft capturan la escala no lineal del precio.
 # =============================================================================
 
-# Quitar columna de bias agregada en Seccion B (columna 0 = unos)
-# La red neuronal tiene bias propio en cada capa
-Xtr_nn = torch.tensor(Xtr[:, 1:], dtype=torch.float32)   # (n_tr, 5)
-Ytr_nn = torch.tensor(Ytr,        dtype=torch.float32).unsqueeze(1)  # (n_tr, 1)
-Xte_nn = torch.tensor(Xte[:, 1:], dtype=torch.float32)   # (n_te, 5)
-Yte_nn = torch.tensor(Yte,        dtype=torch.float32).unsqueeze(1)  # (n_te, 1)
+FEAT_NAMES_LM = ['sqft_living', 'grade', 'bathrooms', 'bedrooms',
+                 'lat', 'long', 'waterfront', 'view', 'condition',
+                 'sqft_living15', 'floors', 'sqft_above']
 
-# DataLoader para mini-batches (fitnet de MATLAB usa batch completo en LM;
-# aqui usamos batch completo tambien para la comparacion mas justa)
-dataset_tr = TensorDataset(Xtr_nn, Ytr_nn)
-loader_tr  = DataLoader(dataset_tr, batch_size=len(Xtr_nn), shuffle=True)
+Y_raw_lm = np.log1p(df_clean['price'].values.astype(float))
+N_lm     = len(Y_raw_lm)
 
-print(f"\n  Tensores de entrenamiento: {Xtr_nn.shape}  ->  {Ytr_nn.shape}")
-print(f"  Tensores de test:          {Xte_nn.shape}  ->  {Yte_nn.shape}")
+# Particion 70/15/15 (antes de computar zipcode para evitar leakage)
+rng_lm_gen = np.random.default_rng(42)
+idx_lm_all = rng_lm_gen.permutation(N_lm)
+n_tr_lm    = int(0.70 * N_lm)
+n_vl_lm    = int(0.15 * N_lm)
+idx_tr_lm  = idx_lm_all[:n_tr_lm]
+idx_vl_lm  = idx_lm_all[n_tr_lm:n_tr_lm + n_vl_lm]
+idx_te_lm  = idx_lm_all[n_tr_lm + n_vl_lm:]
+
+# Precio mediano y std por zipcode -- calculado SOLO en training set
+df_tr_tmp       = df_clean.iloc[idx_tr_lm]
+zip_med_train   = np.log1p(df_tr_tmp.groupby('zipcode')['price'].median())
+zip_std_train   = df_tr_tmp.groupby('zipcode')['price'].apply(
+                      lambda x: np.log1p(x).std()).fillna(0)
+zip_feat_series = df_clean['zipcode'].map(zip_med_train)
+zip_std_series  = df_clean['zipcode'].map(zip_std_train)
+zip_feat_series.fillna(zip_med_train.median(), inplace=True)
+zip_std_series.fillna(zip_std_train.median(), inplace=True)
+zip_feat_lm     = zip_feat_series.values.reshape(-1, 1).astype(float)
+zip_std_lm      = zip_std_series.values.reshape(-1, 1).astype(float)
+
+# Construccion de X con todas las features (23 total)
+X_base_lm    = df_clean[FEAT_NAMES_LM].values.astype(float)
+house_age_lm = (2015 - df_clean['yr_built'].values).astype(float).reshape(-1, 1)
+renovated_lm = (df_clean['yr_renovated'].values > 0).astype(float).reshape(-1, 1)
+# Log-transform de sqft: captura efecto de escala (precio crece sub-linealmente en sqft)
+log_sqft_living = np.log1p(df_clean['sqft_living'].values).astype(float).reshape(-1, 1)
+log_sqft_lot    = np.log1p(df_clean['sqft_lot'].values).astype(float).reshape(-1, 1)
+# Ratio sqft_living15/sqft_living: como la casa se compara con vecinos
+sqft_ratio_15   = (df_clean['sqft_living15'].values /
+                   df_clean['sqft_living'].values.clip(1)).astype(float).reshape(-1, 1)
+# Interaccion grade x sqft_living (normalizada): premium de calidad en casas grandes
+grade_x_sqft    = (df_clean['grade'].values *
+                   df_clean['sqft_living'].values / 1e5).astype(float).reshape(-1, 1)
+# Superficie del sotano (log): valor adicional de espacio habitable
+log_sqft_bsmt   = np.log1p(df_clean['sqft_basement'].values).astype(float).reshape(-1, 1)
+# Tamaño lote vecinos (log): contexto de densidad del barrio
+log_sqft_lot15  = np.log1p(df_clean['sqft_lot15'].values).astype(float).reshape(-1, 1)
+# Mes de venta (codificacion ciclica): estacionalidad del mercado inmobiliario
+import pandas as _pd
+_months = _pd.to_datetime(df_clean['date']).dt.month.values
+sale_month_sin  = np.sin(2 * np.pi * _months / 12).astype(float).reshape(-1, 1)
+sale_month_cos  = np.cos(2 * np.pi * _months / 12).astype(float).reshape(-1, 1)
+# Edad efectiva: si reformada, usa edad desde reforma; si no, edad desde construccion
+_yr_ren = df_clean['yr_renovated'].values
+eff_age = np.where(_yr_ren > 0, 2015 - _yr_ren,
+                   2015 - df_clean['yr_built'].values).astype(float).reshape(-1, 1)
+# Interaccion grade x condition: calidad ESTRUCTURAL (grado) × estado actual
+grade_x_cond    = (df_clean['grade'].values *
+                   df_clean['condition'].values).astype(float).reshape(-1, 1)
+# Distancia al centro de Seattle (lat 47.6062, long -122.3321): premium urbano
+_dlat = (df_clean['lat'].values - 47.6062)
+_dlon = (df_clean['long'].values - (-122.3321)) * np.cos(np.radians(47.6062))
+dist_center     = np.sqrt(_dlat**2 + _dlon**2).astype(float).reshape(-1, 1)
+
+# Feature kNN geo-price: precio log ponderado por distancia de k=15 vecinos mas
+# cercanos (lat/long). LOO sobre training para evitar data leakage.
+print("  Computando kNN geo-price (k=15, LOO)...", flush=True)
+_K_KNN  = 15
+_ll_all = np.column_stack([df_clean['lat'].values, df_clean['long'].values])
+_ll_tr  = _ll_all[idx_tr_lm]
+_lp_tr  = Y_raw_lm[idx_tr_lm]
+_N_all  = len(_ll_all)
+_CHUNK  = 500
+_tr_pos = {g: i for i, g in enumerate(idx_tr_lm)}
+knn_geo = np.zeros(_N_all)
+
+for _s in range(0, _N_all, _CHUNK):
+    _e   = min(_s + _CHUNK, _N_all)
+    _pts = _ll_all[_s:_e]
+    _d   = np.sqrt(((_ll_tr[None,:,:] - _pts[:,None,:])**2).sum(axis=2))
+    for _j in range(_e - _s):
+        _dj = _d[_j].copy()
+        _gi = _s + _j
+        if _gi in _tr_pos:
+            _dj[_tr_pos[_gi]] = np.inf
+        _ki = np.argpartition(_dj, _K_KNN)[:_K_KNN]
+        _wi = 1.0 / (_dj[_ki] + 1e-8)
+        knn_geo[_gi] = (_lp_tr[_ki] * _wi).sum() / _wi.sum()
+
+print("  kNN feature listo.", flush=True)
+knn_geo_feat = knn_geo.reshape(-1, 1)
+
+# Interaccion grade x knn_geo: "calidad de la casa en un barrio caro"
+grade_x_knn = (df_clean['grade'].values.reshape(-1,1).astype(float) *
+               knn_geo_feat)
+
+X_raw_lm  = np.hstack([X_base_lm, house_age_lm, renovated_lm, zip_feat_lm,
+                        log_sqft_living, log_sqft_lot, sqft_ratio_15, grade_x_sqft,
+                        log_sqft_bsmt, log_sqft_lot15, sale_month_sin, sale_month_cos,
+                        eff_age, grade_x_cond, dist_center,
+                        knn_geo_feat, zip_std_lm, grade_x_knn])
+n_feat_lm = X_raw_lm.shape[1]   # 30
+feat_names_all_lm = (FEAT_NAMES_LM +
+                     ['house_age', 'renovated', 'zip_log_med_price',
+                      'log_sqft_living', 'log_sqft_lot', 'sqft_ratio_15', 'grade_x_sqft',
+                      'log_sqft_bsmt', 'log_sqft_lot15', 'month_sin', 'month_cos',
+                      'eff_age', 'grade_x_cond', 'dist_center',
+                      'knn_k15_geo', 'zip_log_std_price', 'grade_x_knn_geo'])
+
+Xmin_lm    = X_raw_lm.min(axis=0)
+Xmax_lm    = X_raw_lm.max(axis=0)
+Ymin_lm    = Y_raw_lm.min()
+Ymax_lm    = Y_raw_lm.max()
+rng_lm_arr = Xmax_lm - Xmin_lm
+rng_lm_arr[rng_lm_arr == 0] = 1.0
+X_n_lm = 2 * (X_raw_lm - Xmin_lm) / rng_lm_arr - 1
+Y_n_lm = 2 * (Y_raw_lm - Ymin_lm) / (Ymax_lm - Ymin_lm) - 1
+
+# float64 para precision numerica en el sistema LM
+Xtr_lm = torch.tensor(X_n_lm[idx_tr_lm], dtype=torch.float64)
+Ytr_lm = torch.tensor(Y_n_lm[idx_tr_lm], dtype=torch.float64).unsqueeze(1)
+Xvl_lm = torch.tensor(X_n_lm[idx_vl_lm], dtype=torch.float64)
+Yvl_lm = torch.tensor(Y_n_lm[idx_vl_lm], dtype=torch.float64).unsqueeze(1)
+Xte_lm = torch.tensor(X_n_lm[idx_te_lm], dtype=torch.float64)
+Yte_lm = torch.tensor(Y_n_lm[idx_te_lm], dtype=torch.float64).unsqueeze(1)
+
+print(f"\n  Features ({n_feat_lm}): {', '.join(feat_names_all_lm)}")
+print(f"  Target:       log1p(price), mapminmax [-1, 1]")
+print(f"  Train: {len(idx_tr_lm):,}  |  Val: {len(idx_vl_lm):,}  |  Test: {len(idx_te_lm):,}")
 
 # =============================================================================
-#  C.2 -- DEFINICION DE LA RED (fitnet equivalente)
+#  C.2 -- RED NEURONAL 3 CAPAS CON LeakyReLU, COMPATIBLE CON LM
 #
-#  fitnet(10) en MATLAB:
-#    - 1 capa oculta con 10 neuronas
-#    - Activacion: tansig (= tanh)
-#    - Capa de salida: purelin (= lineal)
-#    - Inicializacion: Nguyen-Widrow (aproximamos con kaiming_uniform)
+#  fitnet3(28,20,14): 3 capas ocultas LeakyReLU + salida lineal.
+#  LeakyReLU evita la saturacion del tanh en valores extremos, mejorando el
+#  flujo de gradiente en la Jacobiana. La derivada es constante por partes:
+#    d/dz = 1  si z > 0  /  0.01  si z <= 0  (sin saturacion)
+#
+#  Con 29 features: P = 29*32+32 + 32*22+22 + 22*14+14 + 14+1 = 1993 params.
+#  Jacobiana full-batch: ~22447 x 1993 ~ 357 MB float64. Manejable con jac_batch.
+#  3 capas: mas capacidad representativa con parametros similares a 2 capas.
 # =============================================================================
 
-import torch.nn.functional as F
+ALPHA_LRELU = 0.01   # pendiente negativa de LeakyReLU
 
-class FitNet(torch.nn.Module):
-    def __init__(self, n_input, n_hidden=128, n_output=1):
-        super(FitNet, self).__init__()
-        # Ampliamos a 128 neuronas y agregamos una segunda capa oculta para llegar al >90%
-        self.hidden1 = torch.nn.Linear(n_input, n_hidden)
-        self.hidden2 = torch.nn.Linear(n_hidden, n_hidden // 2)
-        self.output  = torch.nn.Linear(n_hidden // 2, n_output)
+class FitNetLM2(nn.Module):
+    """fitnet 3 capas LeakyReLU: n -> [H1] -> [H2] -> [H3] -> 1 (lineal).
+    Llamada FitNetLM2 por compatibilidad con el resto del codigo."""
+    def __init__(self, n_input, n_h1=28, n_h2=20, n_h3=14):
+        super().__init__()
+        self.layer1 = nn.Linear(n_input, n_h1)
+        self.layer2 = nn.Linear(n_h1, n_h2)
+        self.layer3 = nn.Linear(n_h2, n_h3)
+        self.output = nn.Linear(n_h3, 1)
+        self.lrelu  = nn.LeakyReLU(ALPHA_LRELU)
+        # He initialization (Kaiming) para activaciones tipo ReLU
+        nn.init.kaiming_uniform_(self.layer1.weight, a=ALPHA_LRELU, nonlinearity='leaky_relu')
+        nn.init.zeros_(self.layer1.bias)
+        nn.init.kaiming_uniform_(self.layer2.weight, a=ALPHA_LRELU, nonlinearity='leaky_relu')
+        nn.init.zeros_(self.layer2.bias)
+        nn.init.kaiming_uniform_(self.layer3.weight, a=ALPHA_LRELU, nonlinearity='leaky_relu')
+        nn.init.zeros_(self.layer3.bias)
+        nn.init.xavier_uniform_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
 
     def forward(self, x):
-        # Usamos ReLU en lugar de tanh, es el estándar en Deep Learning para regresión
-        x = F.relu(self.hidden1(x))
-        x = F.relu(self.hidden2(x))
-        return self.output(x)
+        h1 = self.lrelu(self.layer1(x))
+        h2 = self.lrelu(self.layer2(h1))
+        h3 = self.lrelu(self.layer3(h2))
+        return self.output(h3)
 
 torch.manual_seed(42)
-# Cambia el 5 por un 10 (o por X_n.shape[1] que tiene 10 columnas)
-n_entradas = len(FEAT_NAMES) # Esto valdrá 10
-modelo_nn = FitNet(n_input=n_entradas, n_hidden=128, n_output=1)
+model_lm    = FitNetLM2(n_input=n_feat_lm, n_h1=N_H1_LM, n_h2=N_H2_LM, n_h3=N_H3_LM).double()
+n_params_lm = sum(param.numel() for param in model_lm.parameters())
 
-n_params = sum(p.numel() for p in modelo_nn.parameters())
-print(f"\n  Parametros totales de la red: {n_params}")
-print(f"  Detalle arquitectura:\n{modelo_nn}")
+print(f"\n  Arquitectura: {n_feat_lm} -> [{N_H1_LM},lrelu] -> [{N_H2_LM},lrelu] -> [{N_H3_LM},lrelu] -> 1")
+print(f"  Parametros P = {n_params_lm}")
+print(f"  Detalle:\n{model_lm}")
 
 # =============================================================================
-#  C.3 -- ENTRENAMIENTO CON L-BFGS
+#  C.3 -- LEVENBERG-MARQUARDT CON JACOBIANA ANALITICA (3 CAPAS LeakyReLU)
 #
-#  L-BFGS es el optimizador de PyTorch mas cercano a Levenberg-Marquardt:
-#    - Segundo orden (usa curvatura como N-R y LM)
-#    - Convergencia cuasi-cuadratica
-#    - Apropiado para datasets que entran en memoria (batch completo)
+#  La Jacobiana d(r_i)/d(W_k) se computa de forma cerrada (backprop manual):
 #
-#  Se agrega Early Stopping sobre el conjunto de validacion para replicar
-#  el criterio de parada de MATLAB (validation checks).
+#    d_lrelu(z) = 1 si z>0, alpha si z<=0   (LeakyReLU, sin saturacion)
+#
+#    delta3_{i,j} = W4_{0,j} * d_lrelu(z3_{i,j})          [∂y/∂z3]
+#    delta2_{i,j} = sum_k W3_{k,j} * delta3_{i,k} * d_lrelu(z2_{i,j})
+#    delta1_{i,j} = sum_k W2_{k,j} * delta2_{i,k} * d_lrelu(z1_{i,j})
+#
+#  Bloques de J (concatenados, coinciden con model.parameters()):
+#    dW1[i,j,k] = delta1[i,j] * x[i,k]        -> (N, H1*n)
+#    db1[i,j]   = delta1[i,j]                  -> (N, H1)
+#    ... idem para capas 2, 3 y output
+#
+#  Regularizacion L2 integrada: (J^T J + (mu+lam_N)*I) dW = -(J^T r + lam_N*W)
+#
+#  Referencia: Hagan & Menhaj (1994). "Training feedforward networks with
+#              the Marquardt algorithm." IEEE TNN 5(6):989-993.
 # =============================================================================
 
-criterion = nn.MSELoss()
+def jacobian_analitico(model, x, jac_batch=3000):
+    """
+    Jacobiana analitica para FitNetLM2 (3 capas LeakyReLU), forma (N, P).
+    Procesada en mini-bloques para controlar pico de memoria.
 
-# -- Conjunto de validacion (15%) para Early Stopping ------------------------
-# Reutilizamos idx_vl definido en Seccion B
-Xvl_nn = torch.tensor(X_b[idx[n_tr:n_tr + n_vl], 1:], dtype=torch.float32)
-Yvl_nn = torch.tensor(Y_n[idx[n_tr:n_tr + n_vl]],     dtype=torch.float32).unsqueeze(1)
+    Backprop manual con LeakyReLU (derivada constante por partes):
+      d_lrelu(z) = 1  si z > 0  /  alpha  si z <= 0
 
-optimizer = torch.optim.LBFGS(
-    modelo_nn.parameters(),
-    lr=0.8,
-    max_iter=20,          # iteraciones internas de busqueda lineal por paso
-    history_size=10,      # memoria de L-BFGS (m en Nocedal & Wright)
-    line_search_fn='strong_wolfe'
-)
+      delta3 = W4 * d_lrelu(z3)                       [∂y/∂z3]
+      delta2 = (delta3 @ W3) * d_lrelu(z2)            [∂y/∂z2]
+      delta1 = (delta2 @ W2) * d_lrelu(z1)            [∂y/∂z1]
 
-MAX_EPOCHS    = 500
-PATIENCE      = 25        # early stopping: epocas sin mejora en validacion
-TOL_NN        = 1e-7
+    Orden en J coincide con model.parameters():
+      layer1.{weight,bias} | layer2.{weight,bias} | layer3.{weight,bias} | output.{weight,bias}
+    """
+    W1 = model.layer1.weight.data    # (H1, n)
+    b1 = model.layer1.bias.data
+    W2 = model.layer2.weight.data    # (H2, H1)
+    b2 = model.layer2.bias.data
+    W3 = model.layer3.weight.data    # (H3, H2)
+    b3 = model.layer3.bias.data
+    W4 = model.output.weight.data    # (1,  H3)
+    H1, n = W1.shape
+    H2    = W2.shape[0]
+    H3    = W3.shape[0]
+    N     = x.shape[0]
+    P     = H1*n + H1 + H2*H1 + H2 + H3*H2 + H3 + H3 + 1
 
-loss_tr_hist  = []
-loss_vl_hist  = []
-best_vl_loss  = float('inf')
-best_weights  = None
-patience_cnt  = 0
-epoch_conv    = 0
+    J = torch.zeros(N, P, dtype=x.dtype)
+    alpha = x.new_tensor(ALPHA_LRELU)
 
-print(f"\n  Optimizador: L-BFGS (lr=0.8, history=10, Wolfe line search)")
-print(f"  Early stopping: patience={PATIENCE}, TOL={TOL_NN}")
-print(f"\n  {'Epoca':<8} {'MSE Train':>14} {'MSE Val':>14}  Estado")
-print("  " + "-" * 50)
+    for s in range(0, N, jac_batch):
+        e   = min(s + jac_batch, N)
+        xb  = x[s:e]
+        nb  = e - s
 
-for epoch in range(1, MAX_EPOCHS + 1):
+        z1 = xb @ W1.T + b1                            # (nb, H1)
+        h1 = torch.where(z1 > 0, z1, alpha * z1)      # LeakyReLU
+        z2 = h1 @ W2.T + b2                            # (nb, H2)
+        h2 = torch.where(z2 > 0, z2, alpha * z2)
+        z3 = h2 @ W3.T + b3                            # (nb, H3)
+        h3 = torch.where(z3 > 0, z3, alpha * z3)
 
-    # -- Paso L-BFGS (requiere closure) --------------------------------------
-    def closure():
-        optimizer.zero_grad()
-        pred = modelo_nn(Xtr_nn)
-        loss = criterion(pred, Ytr_nn)
-        loss.backward()
-        return loss
+        # Derivadas de LeakyReLU: 1 si z>0, alpha si z<=0
+        d1 = torch.where(z1 > 0, torch.ones_like(z1), alpha * torch.ones_like(z1))
+        d2 = torch.where(z2 > 0, torch.ones_like(z2), alpha * torch.ones_like(z2))
+        d3 = torch.where(z3 > 0, torch.ones_like(z3), alpha * torch.ones_like(z3))
 
-    optimizer.step(closure)
+        delta3 = W4 * d3                               # (nb, H3): ∂y/∂z3
+        delta2 = (delta3 @ W3) * d2                   # (nb, H2): ∂y/∂z2
+        delta1 = (delta2 @ W2) * d1                   # (nb, H1): ∂y/∂z1
 
-    # -- Metricas de esta epoca -----------------------------------------------
+        dW1 = (delta1.unsqueeze(2) * xb.unsqueeze(1)).reshape(nb, -1)
+        db1 = delta1
+        dW2 = (delta2.unsqueeze(2) * h1.unsqueeze(1)).reshape(nb, -1)
+        db2 = delta2
+        dW3 = (delta3.unsqueeze(2) * h2.unsqueeze(1)).reshape(nb, -1)
+        db3 = delta3
+        dW4 = h3                                       # (nb, H3)
+        db4 = torch.ones(nb, 1, dtype=x.dtype)
+
+        J[s:e] = torch.cat([dW1, db1, dW2, db2, dW3, db3, dW4, db4], dim=1)
+
+    return J   # (N, P)
+
+def get_flat_params(model):
+    return torch.cat([param.data.view(-1) for param in model.parameters()])
+
+def set_flat_params(model, flat_params):
+    offset = 0
+    for param in model.parameters():
+        n = param.numel()
+        param.data.copy_(flat_params[offset:offset + n].view(param.shape))
+        offset += n
+
+def mse_completo(model, x, y):
     with torch.no_grad():
-        loss_tr = criterion(modelo_nn(Xtr_nn), Ytr_nn).item()
-        loss_vl = criterion(modelo_nn(Xvl_nn), Yvl_nn).item()
+        return ((model(x) - y) ** 2).mean().item()
 
-    loss_tr_hist.append(loss_tr)
-    loss_vl_hist.append(loss_vl)
-    epoch_conv = epoch
+def desnorm_lm(y_norm):
+    """Revierte mapminmax [-1,1] y luego revierte log1p. Para Seccion C."""
+    y_log = (y_norm + 1) / 2 * (Ymax_lm - Ymin_lm) + Ymin_lm
+    return np.expm1(y_log)
 
-    # -- Early stopping -------------------------------------------------------
-    estado = ""
-    if loss_vl < best_vl_loss - TOL_NN:
-        best_vl_loss = loss_vl
-        best_weights = {k: v.clone() for k, v in modelo_nn.state_dict().items()}
-        patience_cnt = 0
-    else:
-        patience_cnt += 1
-        if patience_cnt >= PATIENCE:
-            estado = "<-- EARLY STOP"
-            if epoch == 1 or epoch % 20 == 0 or estado:
-                print(f"  {epoch:<8} {loss_tr:>14.6e} {loss_vl:>14.6e}  {estado}")
+def run_lm_training(model, Xtr, Ytr, Xvl, Yvl, n_params,
+                    mu_init=0.01, max_iter=300, patience=60,
+                    tol_grad=1e-9, nu_dec=0.1, nu_inc=10.0,
+                    mu_min=1e-12, mu_max=1e10, lambda_reg=0.0, verbose=True):
+    """Entrena con Levenberg-Marquardt usando Jacobiana analitica (full-batch).
+
+    Regularizacion L2 (Tikhonov) integrada en el sistema LM:
+      (J^T J + (mu + lam_N)*I) dW = -(J^T r + lam_N*W)
+    donde lam_N = lambda_reg * N. Es el equivalente bayesiano al dropout para
+    optimizadores de segundo orden: penaliza pesos grandes sin romper la
+    consistencia de la Jacobiana analitica.
+
+    Retorna (best_W, best_val_mse, tr_hist, vl_hist, n_iters, n_acc, n_rej, mu_final).
+    """
+    mu = mu_init
+    best_vl = float('inf')
+    best_W = get_flat_params(model).clone()
+    patience_cnt = 0
+    n_acc = 0
+    n_rej = 0
+    n_iters = 0
+    tr_hist = []
+    vl_hist = []
+    N_tr = len(Xtr)
+    lam_N = lambda_reg * N_tr   # escala para que sea comparable con JTJ ~ O(N)
+
+    for it in range(1, max_iter + 1):
+        with torch.no_grad():
+            J = jacobian_analitico(model, Xtr)
+            r = model(Xtr).squeeze() - Ytr.squeeze()
+
+        W_curr  = get_flat_params(model)
+        mse_old = (r ** 2).mean().item()
+        # Loss regularizada (para criterio de aceptacion)
+        E_old   = mse_old + (lambda_reg / 2) * W_curr.pow(2).sum().item()
+
+        # Sistema LM con Tikhonov: (JTJ + (mu+lam_N)*I) dW = -(JTr + lam_N*W)
+        JTJ = J.T @ J
+        JTr = J.T @ r + lam_N * W_curr
+        A   = JTJ + (mu + lam_N) * torch.eye(n_params, dtype=torch.float64)
+
+        try:
+            delta_W = torch.linalg.solve(A, -JTr)
+        except torch.linalg.LinAlgError:
+            mu = min(mu * nu_inc, mu_max)
+            continue
+
+        W_old = get_flat_params(model).clone()
+        set_flat_params(model, W_old + delta_W)
+
+        with torch.no_grad():
+            r_new   = model(Xtr).squeeze() - Ytr.squeeze()
+            mse_new = (r_new ** 2).mean().item()
+        W_new = get_flat_params(model)
+        E_new = mse_new + (lambda_reg / 2) * W_new.pow(2).sum().item()
+
+        if E_new < E_old:
+            mu = max(mu * nu_dec, mu_min)
+            n_acc += 1
+        else:
+            set_flat_params(model, W_old)
+            mu = min(mu * nu_inc, mu_max)
+            n_rej += 1
+
+        # Validacion: MSE puro (sin reg) para comparar modelos con distinto lambda
+        loss_tr = mse_completo(model, Xtr, Ytr)
+        loss_vl = mse_completo(model, Xvl, Yvl)
+        tr_hist.append(loss_tr)
+        vl_hist.append(loss_vl)
+
+        if loss_vl < best_vl:
+            best_vl = loss_vl
+            best_W  = get_flat_params(model).clone()
+            patience_cnt = 0
+        else:
+            patience_cnt += 1
+
+        n_iters   = it
+        grad_norm = JTr.norm().item()
+
+        if verbose and (it == 1 or it % 25 == 0 or patience_cnt >= patience):
+            print(f"  {it:<6} {loss_tr:>14.6e} {loss_vl:>14.6e} {mu:>12.2e}")
+
+        if patience_cnt >= patience:
+            if verbose:
+                print(f"\n  Early stopping: {patience} iters sin mejora en validacion.")
+            break
+        if grad_norm < tol_grad:
+            if verbose:
+                print(f"\n  Convergencia: ||J^T r|| = {grad_norm:.2e} < TOL")
             break
 
-    if epoch == 1 or epoch % 20 == 0 or estado:
-        print(f"  {epoch:<8} {loss_tr:>14.6e} {loss_vl:>14.6e}  {estado}")
+    return best_W, best_vl, tr_hist, vl_hist, n_iters, n_acc, n_rej, mu
 
-# Restaurar mejores pesos (criterio MATLAB: mejor performance en validacion)
-if best_weights is not None:
-    modelo_nn.load_state_dict(best_weights)
-    print(f"\n  Pesos restaurados al minimo de validacion.")
+# -- Hiperparametros LM -------------------------------------------------------
+MU_INIT     = 0.01     # amortiguamiento inicial (Hagan & Menhaj 1994)
+MU_MIN      = 1e-12
+MU_MAX      = 1e10
+NU_DEC      = 0.1      # reduccion de mu al aceptar paso
+NU_INC      = 10.0     # incremento de mu al rechazar paso
+MAX_ITER_LM = 300
+TOL_GRAD_LM = 1e-9
+PATIENCE_LM = 120      # epocas sin mejora en validacion
+
+N_TR_LM = len(Xtr_lm)
+
+# -- Augmentacion de datos: +50% copias con ruido gaussiano ------------------
+#  Ruido en espacio normalizado [-1,1]; preserva la estructura local sin
+#  inventar nuevos precios. Expande el training set de 14965 a 22447 muestras.
+SIGMA_AUG = 0.004   # ruido reducido: evita que Phase 2 aprenda el ruido en vez de la señal
+torch.manual_seed(0)
+Xtr_aug_noise = torch.clamp(
+    Xtr_lm + SIGMA_AUG * torch.randn_like(Xtr_lm), -1.1, 1.1)
+Xtr_aug = torch.cat([Xtr_lm, Xtr_aug_noise])
+Ytr_aug = torch.cat([Ytr_lm, Ytr_lm])   # mismo precio para copia ruidosa
+N_TR_AUG = len(Xtr_aug)
+
+print(f"\n  Jacobiana FULL-BATCH: N_orig={N_TR_LM}, N_aug={N_TR_AUG}, P={n_params_lm}")
+print(f"  mu_init={MU_INIT}, NU_dec={NU_DEC}, NU_inc={NU_INC}")
+print(f"  Augmentacion: +{len(Xtr_aug_noise)} muestras con ruido σ={SIGMA_AUG}")
+
+# -- Fase 0: cross-validation de lambda_reg sobre el validation set ----------
+#  Grid search: lambda_reg x semillas x iteraciones cortas.
+#  Dropout no es compatible con la Jacobiana analitica (J seria estocastica);
+#  la regularizacion L2 (Tikhonov) es el equivalente bayesiano para LM.
+LAMBDA_GRID    = [0.0, 1e-6, 1e-5, 5e-5, 1e-4]
+SEEDS_CV       = [42, 7, 13]
+MAX_ITER_CV    = 25
+PATIENCE_CV    = 20
+
+print(f"\n  Fase 0: grid search lambda_reg {LAMBDA_GRID}")
+print(f"          ({len(SEEDS_CV)} semillas x {MAX_ITER_CV} iter, val set 15%)\n")
+print(f"  {'lambda':>10} {'seed':>6} {'val_MSE':>14}")
+print("  " + "-" * 34)
+
+best_config = {'val': float('inf'), 'lam': 0.0, 'W': None, 'mu': MU_INIT}
+
+for lam_cv in LAMBDA_GRID:
+    for seed_cv in SEEDS_CV:
+        torch.manual_seed(seed_cv)
+        m_cv = FitNetLM2(n_input=n_feat_lm, n_h1=N_H1_LM, n_h2=N_H2_LM, n_h3=N_H3_LM).double()
+        W_cv, vl_cv, _, _, _, _, _, mu_cv = run_lm_training(
+            m_cv, Xtr_aug, Ytr_aug, Xvl_lm, Yvl_lm,
+            n_params=n_params_lm, mu_init=MU_INIT,
+            max_iter=MAX_ITER_CV, patience=PATIENCE_CV,
+            tol_grad=TOL_GRAD_LM, nu_dec=NU_DEC, nu_inc=NU_INC,
+            mu_min=MU_MIN, mu_max=MU_MAX, lambda_reg=lam_cv, verbose=False
+        )
+        print(f"  {lam_cv:>10.1e} {seed_cv:>6}  {vl_cv:>14.6e}")
+        if vl_cv < best_config['val']:
+            best_config = {'val': vl_cv, 'lam': lam_cv,
+                           'W': W_cv.clone(), 'mu': mu_cv}
+
+LAMBDA_REG = best_config['lam']
+print(f"\n  Mejor config: lambda_reg={LAMBDA_REG:.1e}  val_MSE={best_config['val']:.6e}")
+
+# -- Fase 1: 5 reinicios cortos con lambda* para explorar cuencas ------------
+SEEDS_LM       = [42, 7, 13, 99, 2024]
+MAX_ITER_SHORT = 35
+PATIENCE_SHORT = 25
+
+print(f"\n  Fase 1: {len(SEEDS_LM)} reinicios cortos ({MAX_ITER_SHORT} iter, lambda={LAMBDA_REG:.1e})")
+
+ensemble_models  = []   # almacena los N modelos del ensemble
+ensemble_val_mse = []
+
+for i_rs, seed_rs in enumerate(SEEDS_LM):
+    torch.manual_seed(seed_rs)
+    m_tmp = FitNetLM2(n_input=n_feat_lm, n_h1=N_H1_LM, n_h2=N_H2_LM, n_h3=N_H3_LM).double()
+    W_rs, vl_rs, _, _, nit_rs, _, _, mu_rs = run_lm_training(
+        m_tmp, Xtr_aug, Ytr_aug, Xvl_lm, Yvl_lm,
+        n_params=n_params_lm, mu_init=MU_INIT,
+        max_iter=MAX_ITER_SHORT, patience=PATIENCE_SHORT,
+        tol_grad=TOL_GRAD_LM, nu_dec=NU_DEC, nu_inc=NU_INC,
+        mu_min=MU_MIN, mu_max=MU_MAX, lambda_reg=LAMBDA_REG, verbose=False
+    )
+    print(f"    Restart {i_rs+1} (seed={seed_rs:4d}): val_MSE={vl_rs:.6e}  iters={nit_rs}"
+          f"  mu_final={mu_rs:.2e}")
+    # Guardar modelo pre-entrenado para ensemble
+    set_flat_params(m_tmp, W_rs)
+    ensemble_models.append(m_tmp)
+    ensemble_val_mse.append(vl_rs)
+
+# Ordenar por val_MSE para logging
+best_val_init = min(ensemble_val_mse)
+best_mu_init  = MU_INIT  # se resetea para Phase 2 (continuacion desde punto bueno)
+print(f"\n  Mejor val_MSE (Phase 1): {best_val_init:.6e}")
+
+# -- Fase 2: continuar entrenando TODOS los modelos ---------------------------
+#  Ensemble: promedio de N modelos reduce varianza y mejora R2 sistematicamente.
+#  Cada modelo parte de una cuenca diferente → diversidad de predicciones.
+print(f"\n  Fase 2: entrenamiento completo de {len(SEEDS_LM)} modelos ({MAX_ITER_LM} iter c/u)")
+
+loss_tr_lm_hist = []
+loss_vl_lm_hist = []
+epoch_conv_lm   = 0
+n_aceptados     = 0
+n_rechazados    = 0
+
+for i_ens, m_ens in enumerate(ensemble_models):
+    print(f"\n  --- Modelo {i_ens+1}/{len(ensemble_models)} (seed={SEEDS_LM[i_ens]}) ---")
+    print(f"  {'Iter':<6} {'MSE Train':>14} {'MSE Val':>14} {'mu':>12}")
+    print("  " + "-" * 55)
+
+    W_ens, vl_ens, tr_h, vl_h, ep_ens, acc_ens, rej_ens, _ = run_lm_training(
+        m_ens, Xtr_aug, Ytr_aug, Xvl_lm, Yvl_lm,
+        n_params=n_params_lm, mu_init=MU_INIT,
+        max_iter=MAX_ITER_LM, patience=PATIENCE_LM,
+        tol_grad=TOL_GRAD_LM, nu_dec=NU_DEC, nu_inc=NU_INC,
+        mu_min=MU_MIN, mu_max=MU_MAX, lambda_reg=LAMBDA_REG, verbose=True
+    )
+    set_flat_params(m_ens, W_ens)
+    n_aceptados  += acc_ens
+    n_rechazados += rej_ens
+    epoch_conv_lm = max(epoch_conv_lm, ep_ens)
+    # Usar curvas del mejor modelo (menor val_MSE final)
+    if vl_ens <= min(ensemble_val_mse):
+        loss_tr_lm_hist = tr_h
+        loss_vl_lm_hist = vl_h
+    ensemble_val_mse[i_ens] = vl_ens
+
+print(f"\n  Ensemble entrenado. val_MSE individuales: "
+      f"{[f'{v:.4e}' for v in ensemble_val_mse]}")
+print(f"  Aceptados totales: {n_aceptados}  |  Rechazados: {n_rechazados}")
+
+# model_lm apunta al mejor modelo individual para compatibilidad con el resto del codigo
+best_idx = int(np.argmin(ensemble_val_mse))
+model_lm = ensemble_models[best_idx]
 
 # =============================================================================
-#  C.4 -- EVALUACION EN TEST SET
+#  C.4 -- EVALUACION EN TEST SET (ENSEMBLE)
 # =============================================================================
 
 with torch.no_grad():
-    Ypred_nn_norm = modelo_nn(Xte_nn).numpy().flatten()
+    # Ensemble ponderado por 1/val_MSE: mejor modelo aporta mas
+    preds_test  = [m(Xte_lm).numpy().flatten() for m in ensemble_models]
+    w_ens_raw   = np.array([1.0 / v for v in ensemble_val_mse])
+    w_ens       = w_ens_raw / w_ens_raw.sum()
+Ypred_lm_norm = sum(w * p for w, p in zip(w_ens, preds_test))
+print(f"  Pesos ensemble (1/MSE norm): {[f'{w:.3f}' for w in w_ens]}")
 
-Ypred_nn_usd = desnorm(Ypred_nn_norm)
+Ypred_lm_usd = desnorm_lm(Ypred_lm_norm)
+Yreal_lm_usd = desnorm_lm(Yte_lm.numpy().flatten())
 
-rmse_nn = np.sqrt(np.mean((Yreal_te_usd - Ypred_nn_usd) ** 2))
-mae_nn  = np.mean(np.abs(Yreal_te_usd - Ypred_nn_usd))
-r2_nn   = 1 - np.sum((Yreal_te_usd - Ypred_nn_usd) ** 2) / \
-              np.sum((Yreal_te_usd - Yreal_te_usd.mean()) ** 2)
+# Tambien calcular R2 del mejor modelo individual (para referencia)
+with torch.no_grad():
+    pred_best_norm = model_lm(Xte_lm).numpy().flatten()
+pred_best_usd = desnorm_lm(pred_best_norm)
+r2_best_single = 1 - np.sum((Yreal_lm_usd - pred_best_usd)**2) / \
+                     np.sum((Yreal_lm_usd - Yreal_lm_usd.mean())**2)
 
-print(f"\n  Epocas hasta convergencia: {epoch_conv}")
-print(f"  RMSE Test (fitnet): {fmt_usd(rmse_nn)}")
-print(f"  MAE  Test (fitnet): {fmt_usd(mae_nn)}")
-print(f"  R2   Test (fitnet): {r2_nn:.4f}")
+rmse_nn = np.sqrt(np.mean((Yreal_lm_usd - Ypred_lm_usd) ** 2))
+mae_nn  = np.mean(np.abs(Yreal_lm_usd - Ypred_lm_usd))
+r2_nn   = 1 - np.sum((Yreal_lm_usd - Ypred_lm_usd) ** 2) / \
+              np.sum((Yreal_lm_usd - Yreal_lm_usd.mean()) ** 2)
+
+print(f"\n  Iteraciones max. por modelo: {epoch_conv_lm}")
+print(f"  RMSE Test (ensemble {len(ensemble_models)} modelos): {fmt_usd(rmse_nn)}")
+print(f"  MAE  Test (ensemble): {fmt_usd(mae_nn)}")
+print(f"  R2   Test (ensemble): {r2_nn:.4f}")
+print(f"  R2   Test (mejor individuo): {r2_best_single:.4f}")
 
 # =============================================================================
-#  C.5 -- TABLA COMPARATIVA ACTUALIZADA (N-R vs SGD vs fitnet)
+#  C.5 -- TABLA COMPARATIVA
 # =============================================================================
 
 print("\n" + "=" * 65)
-print("  TABLA COMPARATIVA AMPLIADA -- N-R / SGD / fitnet(10)")
+print("  TABLA COMPARATIVA AMPLIADA -- N-R / SGD / fitnet-LM")
 print("=" * 65)
-print(f"\n  {'Criterio':<28} {'N-R lineal':>14} {'SGD lineal':>14} {'fitnet NN':>12}")
+print(f"\n  {'Criterio':<28} {'N-R lineal':>14} {'SGD lineal':>14} {'fitnet-LM':>12}")
 print("  " + "-" * 72)
 rows_c = [
-    ("Tipo de modelo",       "Lineal",          "Lineal",          "No lineal"),
-    ("Arquitectura",         "10 features+bias","10 features+bias","10-[128-64]-1 ReLU"),
-    ("Optimizador",          "N-R coordinado",  f"GD lr={LR_SGD}", "L-BFGS"),
-    ("Iteraciones/Epocas",   str(n_conv_mv),    str(sgd_conv),     str(epoch_conv)),
-    ("RMSE Test (USD)",      fmt_usd(rmse),     fmt_usd(rmse_sgd), fmt_usd(rmse_nn)),
-    ("R2 Test",              f"{r2:.4f}",        "---",             f"{r2_nn:.4f}"),
-    ("Convergencia",         "Cuadratica",      "Lineal",          "Cuasi-cuadratica"),
-    ("Requiere tuning",      "No",              "Si (lr)",         "Minimo (patience)"),
+    ("Tipo de modelo",      "Lineal",            "Lineal",           "No lineal"),
+    ("Arquitectura",        "10 feat+bias",       "10 feat+bias",    f"{n_feat_lm}-[{N_H1_LM},{N_H2_LM},{N_H3_LM}]-1 lrelu"),
+    ("Optimizador",         "N-R coordinado",    f"GD lr={LR_SGD}",  "Levenberg-Marquardt"),
+    ("Jacobiana",           "Diag H (P,)",        "Gradiente (P,)",  f"J: {N_TR_LM}x{n_params_lm}"),
+    ("Parametros P",        str(p),               str(p),             str(n_params_lm)),
+    ("Iteraciones",         str(n_conv_mv),       str(sgd_conv),      str(epoch_conv_lm)),
+    ("RMSE Test (USD)",     fmt_usd(rmse),        fmt_usd(rmse_sgd),  fmt_usd(rmse_nn)),
+    ("R2 Test",             f"{r2:.4f}",           "---",              f"{r2_nn:.4f}"),
+    ("Convergencia",        "Cuadratica",         "Lineal",           "Cuasi-cuadratica"),
 ]
 for row in rows_c:
     print(f"  {row[0]:<28} {row[1]:>14} {row[2]:>14} {row[3]:>12}")
 
 # =============================================================================
-#  C.6 -- FIGURAS ADICIONALES
+#  C.6 -- FIGURAS
 # =============================================================================
 
-# --- Figura 6: Curvas de aprendizaje (train vs val) --------------------------
+# --- Figura 6: Curvas de convergencia LM -------------------------------------
 fig, ax = plt.subplots(figsize=(9, 4))
-epocas = range(1, len(loss_tr_hist) + 1)
-ax.semilogy(epocas, loss_tr_hist, color='#2E86AB', lw=2, label='MSE Train')
-ax.semilogy(epocas, loss_vl_hist, color='#E84855', lw=2, label='MSE Validacion', linestyle='--')
-ax.scatter(Yreal_te_usd / 1e3, Ypred_nn_usd / 1e3,
-           alpha=0.3, s=8, color='#9B5DE5', label="Red Neuronal (128)")
-# ... (deja la linea del lim_nn y plot igual) ...
+epocas_lm = range(1, len(loss_tr_lm_hist) + 1)
+ax.semilogy(epocas_lm, loss_tr_lm_hist, color='#2E86AB', lw=2, label='MSE Train')
+ax.semilogy(epocas_lm, loss_vl_lm_hist, color='#E84855', lw=2,
+            label='MSE Validacion', linestyle='--')
+ax.set_xlabel("Iteracion LM", fontsize=11)
+ax.set_ylabel("MSE (espacio normalizado)", fontsize=11)
 ax.set_title(
-    f"Figura 7: Test Set KC -- Red Neuronal Profunda\nR2 = {r2_nn:.4f}  |  RMSE = {fmt_usd(rmse_nn)}",
+    f"Figura 6: Convergencia LM -- fitnet({N_H1_LM},{N_H2_LM}) con Jacobiana\n"
+    f"Early stop iter {epoch_conv_lm}  |  RMSE Test = {fmt_usd(rmse_nn)}",
     fontsize=11, fontweight='bold')
 ax.legend(fontsize=10)
 ax.text(0.60, 0.75,
-        f"Epocas: {epoch_conv}\nRMSE Test: {fmt_usd(rmse_nn)}\nR2: {r2_nn:.4f}",
+        f"Iters: {epoch_conv_lm}\nRMSE: {fmt_usd(rmse_nn)}\nR2: {r2_nn:.4f}",
         transform=ax.transAxes, fontsize=9,
         bbox=dict(boxstyle='round,pad=0.4', facecolor='white', edgecolor='gray'))
 plt.tight_layout()
 plt.savefig("figura6_fitnet_learning_curves.png", bbox_inches='tight', dpi=130)
 plt.show()
 
-# --- Figura 7: Pred vs Real -- fitnet ----------------------------------------
+# --- Figura 7: Pred vs Real -- fitnet-LM -------------------------------------
 fig, ax = plt.subplots(figsize=(7, 6))
-ax.scatter(Yreal_te_usd / 1e3, Ypred_nn_usd / 1e3,
-           alpha=0.3, s=8, color='#9B5DE5', label="fitnet(10)")
-lim_nn = [0, max(Yreal_te_usd.max(), Ypred_nn_usd.max()) / 1e3 * 1.05]
+ax.scatter(Yreal_lm_usd / 1e3, Ypred_lm_usd / 1e3,
+           alpha=0.3, s=8, color='#9B5DE5', label=f"fitnet({N_H1_LM},{N_H2_LM})-LM")
+lim_nn = [0, max(Yreal_lm_usd.max(), Ypred_lm_usd.max()) / 1e3 * 1.05]
 ax.plot(lim_nn, lim_nn, 'r--', lw=2, label="y = x (ideal)")
 ax.set_xlabel("Precio real (miles USD)", fontsize=11)
-ax.set_ylabel("Prediccion fitnet (miles USD)", fontsize=11)
+ax.set_ylabel("Prediccion fitnet-LM (miles USD)", fontsize=11)
 ax.set_title(
-    f"Figura 7: Test Set KC -- fitnet(10)\nR2 = {r2_nn:.4f}  |  RMSE = {fmt_usd(rmse_nn)}",
+    f"Figura 7: Test Set KC -- fitnet({N_H1_LM},{N_H2_LM})-LM\n"
+    f"R2 = {r2_nn:.4f}  |  RMSE = {fmt_usd(rmse_nn)}",
     fontsize=11, fontweight='bold')
 ax.legend(fontsize=9)
 plt.tight_layout()
 plt.savefig("figura7_fitnet_pred_vs_real.png", bbox_inches='tight', dpi=130)
 plt.show()
 
-# --- Figura 8: Comparativa RMSE -- N-R lineal vs fitnet NN -------------------
+# --- Figura 8: Comparativa RMSE N-R / SGD / fitnet-LM -----------------------
 fig, ax = plt.subplots(figsize=(7, 4))
-modelos_comp = ['N-R\n(lineal)', 'SGD\n(lineal)', 'fitnet(10)\n(no lineal)']
+modelos_comp = ['N-R\n(lineal)', 'SGD\n(lineal)', f'fitnet({N_H1_LM},{N_H2_LM})\n(LM)']
 rmses_comp   = [rmse / 1e3, rmse_sgd / 1e3, rmse_nn / 1e3]
 colores_comp = ['#2E86AB', '#E84855', '#9B5DE5']
 barras = ax.bar(modelos_comp, rmses_comp, color=colores_comp, width=0.45, edgecolor='white')
@@ -641,7 +1044,7 @@ for bar, val in zip(barras, rmses_comp):
             f"${val:,.1f}k", ha='center', va='bottom', fontsize=11, fontweight='bold')
 ax.set_ylabel("RMSE Test (miles USD)", fontsize=11)
 ax.set_title(
-    "Figura 8: Comparativa RMSE -- Regresion lineal (N-R) vs fitnet(10)\n"
+    f"Figura 8: Comparativa RMSE -- N-R lineal vs fitnet({N_H1_LM},{N_H2_LM})-LM\n"
     "KC House Data -- Test set 15%",
     fontsize=11, fontweight='bold')
 ax.set_ylim(0, max(rmses_comp) * 1.20)
@@ -650,12 +1053,14 @@ plt.savefig("figura8_comparativa_rmse.png", bbox_inches='tight', dpi=130)
 plt.show()
 
 print("\n" + "=" * 65)
-print("  RESUMEN SECCION C -- fitnet(10) PyTorch")
+print(f"  RESUMEN SECCION C -- fitnet({N_H1_LM},{N_H2_LM})-LM (Levenberg-Marquardt)")
 print("=" * 65)
-print(f"\n  Arquitectura:   5 -> [10 neuronas, tanh] -> 1 (lineal)")
-print(f"  Optimizador:    L-BFGS (Wolfe line search)")
-print(f"  Early stopping: patience={PATIENCE}")
-print(f"  Epocas:         {epoch_conv}")
+print(f"\n  Arquitectura:   {n_feat_lm} -> [{N_H1_LM},{N_H2_LM},{N_H3_LM}, lrelu] -> 1 (lineal)")
+print(f"  Optimizador:    Levenberg-Marquardt (Jacobiana analitica, vectorizada)")
+print(f"  Parametros:     P = {n_params_lm}")
+print(f"  Dim. Jacobiana: N x P = {N_TR_LM} x {n_params_lm}  (~{N_TR_LM*n_params_lm/1e6:.1f}M elem)")
+print(f"  Early stopping: patience={PATIENCE_LM}")
+print(f"  Iteraciones:    {epoch_conv_lm}")
 print(f"  RMSE Test:      {fmt_usd(rmse_nn)}")
 print(f"  MAE  Test:      {fmt_usd(mae_nn)}")
 print(f"  R2   Test:      {r2_nn:.4f}")
@@ -797,6 +1202,15 @@ print(f"    Iteraciones:  {n_conv_mv}")
 print(f"    RMSE Test:    {fmt_usd(rmse)}")
 print(f"    MAE  Test:    {fmt_usd(mae)}")
 print(f"    R2   Test:    {r2:.4f}")
+print()
+print(f"  -- SECCION C: fitnet({N_H1_LM},{N_H2_LM})-LM (Levenberg-Marquardt) --------")
+print(f"    Arquitectura: {n_feat_lm} -> [{N_H1_LM},{N_H2_LM},{N_H3_LM}, lrelu] -> 1")
+print(f"    Parametros P: {n_params_lm}")
+print(f"    Jacobiana J:  {N_TR_LM} x {n_params_lm} (full-batch)")
+print(f"    Iteraciones:  {epoch_conv_lm}")
+print(f"    RMSE Test:    {fmt_usd(rmse_nn)}")
+print(f"    MAE  Test:    {fmt_usd(mae_nn)}")
+print(f"    R2   Test:    {r2_nn:.4f}")
 print()
 print("  Referencia: Camelino, Funes, Ziletti (2026)")
 print("  UCC . Metodos Numericos . Grupo 5")
