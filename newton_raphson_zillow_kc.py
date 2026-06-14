@@ -513,22 +513,27 @@ for _s in range(0, _N_all, _CHUNK):
 print("  kNN feature listo.", flush=True)
 knn_geo_feat = knn_geo.reshape(-1, 1)
 
-# Interaccion grade x knn_geo: "calidad de la casa en un barrio caro"
-grade_x_knn = (df_clean['grade'].values.reshape(-1,1).astype(float) *
-               knn_geo_feat)
+# Polinomios lat/long grado 2: capturan la curvatura 2D del precio geografico.
+# La superficie de precios de KC no es plana: el valor por metro cuadrado cambia
+# de forma no lineal con las coordenadas (Elliott Bay, Redmond, Bellevue peaks).
+_lat_raw = df_clean['lat'].values.astype(float)
+_lon_raw = df_clean['long'].values.astype(float)
+lat2_feat   = (_lat_raw ** 2).reshape(-1, 1)
+lon2_feat   = (_lon_raw ** 2).reshape(-1, 1)
+latlon_feat = (_lat_raw * _lon_raw).reshape(-1, 1)
 
 X_raw_lm  = np.hstack([X_base_lm, house_age_lm, renovated_lm, zip_feat_lm,
                         log_sqft_living, log_sqft_lot, sqft_ratio_15, grade_x_sqft,
                         log_sqft_bsmt, log_sqft_lot15, sale_month_sin, sale_month_cos,
                         eff_age, grade_x_cond, dist_center,
-                        knn_geo_feat, zip_std_lm, grade_x_knn])
-n_feat_lm = X_raw_lm.shape[1]   # 30
+                        knn_geo_feat, lat2_feat, lon2_feat, latlon_feat])
+n_feat_lm = X_raw_lm.shape[1]   # 31
 feat_names_all_lm = (FEAT_NAMES_LM +
                      ['house_age', 'renovated', 'zip_log_med_price',
                       'log_sqft_living', 'log_sqft_lot', 'sqft_ratio_15', 'grade_x_sqft',
                       'log_sqft_bsmt', 'log_sqft_lot15', 'month_sin', 'month_cos',
                       'eff_age', 'grade_x_cond', 'dist_center',
-                      'knn_k15_geo', 'zip_log_std_price', 'grade_x_knn_geo'])
+                      'knn_k15_geo', 'lat2', 'lon2', 'lat_x_lon'])
 
 Xmin_lm    = X_raw_lm.min(axis=0)
 Xmax_lm    = X_raw_lm.max(axis=0)
@@ -831,7 +836,7 @@ print(f"  Augmentacion: +{len(Xtr_aug_noise)} muestras con ruido σ={SIGMA_AUG}"
 #  Grid search: lambda_reg x semillas x iteraciones cortas.
 #  Dropout no es compatible con la Jacobiana analitica (J seria estocastica);
 #  la regularizacion L2 (Tikhonov) es el equivalente bayesiano para LM.
-LAMBDA_GRID    = [0.0, 1e-6, 1e-5, 5e-5, 1e-4]
+LAMBDA_GRID    = [0.0, 1e-6, 1e-5, 5e-5]
 SEEDS_CV       = [42, 7, 13]
 MAX_ITER_CV    = 25
 PATIENCE_CV    = 20

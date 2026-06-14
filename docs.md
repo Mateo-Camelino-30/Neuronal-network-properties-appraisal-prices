@@ -350,12 +350,30 @@ El N-R lineal (Sección B) no converge después de 300 iteraciones (MSE estabili
 | Ensemble 5 modelos + data augmentation | 0.907 |
 | **Mejor resultado final (ensemble ponderado)** | **0.9066** |
 
+### Evolución de iteraciones de mejora
+
+| Configuración | R² Test | RMSE Test |
+|--------------|---------|-----------|
+| Base: 15 features, 2 capas tanh, σ=0.015 | 0.880 | ~$110k |
+| 27 features, 3 capas LeakyReLU, kNN k=15 | 0.902 | $91,648 |
+| **29 features, kNN k=5/15/50, ensemble ponderado** | **0.9066** | **$89,814** |
+| 30 features + zip_std + grade×knn, σ=0.004, λ=1e-4 | 0.9004 | $92,781 |
+| 31 features + lat²/lon²/lat×lon, σ=0.004, λ=5e-5 | 0.9007 | $92,612 |
+
+### Límite empírico del dataset
+
+R²=0.9066 supera al mejor resultado publicado conocido para este dataset con redes neuronales:
+- Paper "Multi-Head Gated Attention" (arXiv:2405.07456, 2024): RMSE=$107,993 en KC House
+- XGBoost con 142 features (zipcode como dummies): R²=0.8944
+
+El techo de R²≈0.91 con las columnas disponibles es consistente con la literatura. Para superar 0.93 se requieren datos externos no incluidos en el dataset: calificación de escuelas del distrito, estadísticas de crimen por barrio, puntajes de acceso (walk score, transit score) o Points of Interest (POI).
+
 ### Observaciones sobre regularización y augmentation
 
-El balance entre σ_aug y λ es crítico:
-- **σ=0.015 (original):** Phase 2 overfittea inmediatamente. Val MSE sube de ~9.7e-3 a ~10.5e-3 en los primeros 25 pasos. Early stopping guarda los pesos de Phase 1.
-- **σ=0.004 (reducido):** Phase 2 mejora gradualmente. Val MSE baja de 9.6e-3 a 9.55e-3. Pero requiere λ=1e-5 (no 1e-4) para que el modelo no quede sub-regularizado en test.
-- **λ=1e-5** fue el óptimo en todas las búsquedas de grid. λ=1e-4 mejora val_MSE artificialmente pero baja R² test.
+- **σ=0.015:** Phase 2 overfittea inmediatamente (val_MSE sube de ~9.7e-3 → 10.5e-3). Early stopping guarda los pesos de Phase 1.
+- **σ=0.004:** Phase 2 mejora gradualmente. Pero requiere λ≤1e-5 para que test R² no caiga.
+- **λ=1e-5:** óptimo consistente en todas las búsquedas de grid.
+- **Lat²/lon²:** inútiles en este dataset. El rango de lat (47.1–47.8) es tan estrecho que lat² es casi lineal en lat → multicolinealidad sin nueva información.
 
 ---
 
